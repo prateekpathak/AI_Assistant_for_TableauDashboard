@@ -1,0 +1,7 @@
+fastmcp>=2.0.0
+tableauserverclient>=0.32
+python-dotenv>=1.0.0
+mcp<2
+langchain-mcp-adapters
+langgraph
+langchain-openai
