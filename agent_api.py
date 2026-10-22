@@ -43,7 +43,15 @@ SYSTEM_PROMPT = (
     "correct the filter or fields yourself, and retry (up to 3 times) before "
     "asking the user anything. "
     "For month, quarter or year requests, convert the period to a "
-    "QUANTITATIVE_DATE range from its first to its last day."
+    "QUANTITATIVE_DATE range from its first to its last day. "
+    "Tableau Pulse: use list_pulse_metrics to see the available metrics "
+    "(Total Sales, Total Profit, Total Quantity, Profit Ratio, ...) and "
+    "get_pulse_insights for the current value, change vs previous period or "
+    "year ago (comparison='year_ago'), and top/bottom contributors. Use "
+    "query_datasource for month-by-month trends, using the datasource_id "
+    "that get_pulse_insights returns. If two Pulse metrics share a name, say "
+    "so and pass definition_id. Pulse values are ratios (0.14 = 14%) unless "
+    "the metric is a currency."
 )
 
 state = {}

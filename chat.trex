@@ -9,7 +9,7 @@
     <source-location>
       <!-- Replace with your HTTPS tunnel/host URL -->
       <!--<url>http://localhost:8000/index.html</url>-->
-      <url>https://comparison-wild-courts-quantities.trycloudflare.com/index.html</url>
+      <url>https://ai-assistant-for-tableaudashboard.onrender.com/index.html</url>
     </source-location>
     <icon/>
   </dashboard-extension>

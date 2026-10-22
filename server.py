@@ -501,5 +501,250 @@ def list_users(limit: int = 50, name_filter: Optional[str] = None) -> list[dict]
         return results
 
 
+# ---------------------------------------------------------------------------
+# Tools — Tableau Pulse (metric definitions + insights)
+# ---------------------------------------------------------------------------
+# Pulse is a Tableau Cloud feature exposed under /api/-/pulse/... It uses the
+# same X-Tableau-Auth token as the rest of the REST API, so we reuse the PAT
+# session from _session() exactly like the VizQL Data Service helper above.
+
+_PULSE_GRANULARITY = {
+    "day": "GRANULARITY_BY_DAY",
+    "week": "GRANULARITY_BY_WEEK",
+    "month": "GRANULARITY_BY_MONTH",
+    "quarter": "GRANULARITY_BY_QUARTER",
+    "year": "GRANULARITY_BY_YEAR",
+}
+_PULSE_COMPARISON = {
+    "previous_period": "TIME_COMPARISON_PREVIOUS_PERIOD",
+    "year_ago": "TIME_COMPARISON_YEAR_AGO_PERIOD",
+}
+_PULSE_RANGE = {
+    "current_partial": "RANGE_CURRENT_PARTIAL",
+    "last_complete": "RANGE_LAST_COMPLETE",
+}
+_PULSE_BUNDLE_TYPES = ("ban", "springboard", "detail")
+
+
+def _pulse_request(server: TSC.Server, method: str, path: str,
+                   params: Optional[dict] = None, body: Optional[dict] = None) -> dict:
+    """Call a Tableau Pulse REST endpoint (/api/-/pulse/<path>)."""
+    url = f"{SERVER_URL.rstrip('/')}/api/-/pulse/{path.lstrip('/')}"
+    headers = {"X-Tableau-Auth": server.auth_token, "Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    resp = requests.request(method, url, params=params, json=body, headers=headers, timeout=90)
+    if not resp.ok:
+        raise RuntimeError(f"Pulse request {method} {path} failed ({resp.status_code}): {resp.text[:2000]}")
+    return resp.json()
+
+
+def _pulse_definitions(server: TSC.Server) -> list[dict]:
+    """Fetch every metric definition on the site (follows pagination)."""
+    definitions: list[dict] = []
+    token = None
+    for _ in range(10):  # safety cap: 10 pages
+        params = {"view": "DEFINITION_VIEW_DEFAULT", "page_size": 100}
+        if token:
+            params["page_token"] = token
+        data = _pulse_request(server, "GET", "definitions", params=params)
+        definitions.extend(data.get("definitions", []))
+        token = data.get("next_page_token")
+        if not token:
+            break
+    return definitions
+
+
+def _default_metric(server: TSC.Server, defn: dict) -> dict:
+    """Return the definition's default metric (falls back to the first one)."""
+    metrics = defn.get("metrics") or []
+    if not metrics:  # some views omit metrics, so ask for them explicitly
+        data = _pulse_request(server, "GET", f"definitions/{defn['metadata']['id']}/metrics")
+        metrics = data.get("metrics", [])
+    if not metrics:
+        raise RuntimeError(f"Definition '{defn['metadata']['name']}' has no metrics.")
+    return next((m for m in metrics if m.get("is_default")), metrics[0])
+
+
+def _build_bundle_request(defn: dict, metric: dict, granularity: Optional[str],
+                          comparison: Optional[str], period: Optional[str]) -> dict:
+    """Build the insight-bundle request body from a stored definition + metric."""
+    spec = defn["specification"]
+    stored = metric.get("specification", {})
+    stored_period = stored.get("measurement_period", {})
+
+    measurement_period = {
+        "granularity": _PULSE_GRANULARITY[granularity] if granularity else stored_period.get(
+            "granularity", "GRANULARITY_BY_MONTH"),
+        "range": _PULSE_RANGE[period] if period else stored_period.get("range", "RANGE_CURRENT_PARTIAL"),
+    }
+    comparison_value = (
+        _PULSE_COMPARISON[comparison] if comparison
+        else stored.get("comparison", {}).get("comparison", "TIME_COMPARISON_PREVIOUS_PERIOD")
+    )
+
+    rep = defn.get("representation_options", {})
+    representation = {"type": rep.get("type", "NUMBER_FORMAT_TYPE_NUMBER")}
+    if rep.get("number_units"):
+        representation["number_units"] = rep["number_units"]
+    if rep.get("sentiment_type"):
+        representation["sentiment_type"] = rep["sentiment_type"]
+    if rep.get("currency_code") and rep["currency_code"] != "CURRENCY_CODE_UNSPECIFIED":
+        representation["currency_code"] = rep["currency_code"]
+
+    return {
+        "bundle_request": {
+            "version": 1,
+            "options": {
+                "output_format": "OUTPUT_FORMAT_TEXT",
+                "time_zone": "UTC",
+                "language": "LANGUAGE_EN_US",
+                "locale": "LOCALE_EN_US",
+            },
+            "input": {
+                "metadata": {
+                    "name": defn["metadata"]["name"],
+                    "metric_id": metric["id"],
+                    "definition_id": defn["metadata"]["id"],
+                },
+                "metric": {
+                    "definition": {
+                        "datasource": {"id": spec["datasource"]["id"]},
+                        "basic_specification": spec["basic_specification"],
+                        "is_running_total": spec.get("is_running_total", False),
+                    },
+                    "metric_specification": {
+                        "filters": stored.get("filters", []),
+                        "measurement_period": measurement_period,
+                        "comparison": {"comparison": comparison_value},
+                    },
+                    "extension_options": defn.get("extension_options", {}),
+                    "representation_options": representation,
+                    "insights_options": defn.get("insights_options", {}),
+                },
+            },
+        }
+    }
+
+
+def _summarise_bundle(bundle: dict, max_per_group: int = 12) -> list[dict]:
+    """Reduce a (potentially 200 KB) insight bundle to readable text per group."""
+    result = bundle.get("bundle_response", {}).get("result", {})
+    seen: set[str] = set()
+    groups = []
+    for group in result.get("insight_groups", []):
+        items = []
+        for ins in group.get("insights", []):
+            r = ins.get("result", {})
+            text = (r.get("markup") or r.get("content") or "").strip()
+            if not text or text in seen:  # 'followup' repeats the 'breakdown' group
+                continue
+            seen.add(text)
+            items.append({"type": r.get("type"), "text": text})
+            if len(items) >= max_per_group:
+                break
+        if items:
+            groups.append({"group": group.get("type"), "insights": items})
+    return groups
+
+
+@mcp.tool()
+def list_pulse_metrics() -> list[dict]:
+    """List all Tableau Pulse metric definitions on the site (Tableau Cloud only).
+
+    Returns each metric's name, description, data source, measure, aggregation,
+    allowed breakdown dimensions and time granularities. Use this to find the
+    exact metric name before calling get_pulse_insights. If two definitions
+    share a name, prefer passing definition_id to get_pulse_insights.
+    """
+    with _session() as server:
+        out = []
+        for d in _pulse_definitions(server):
+            spec = d.get("specification", {})
+            basic = spec.get("basic_specification", {})
+            ext = d.get("extension_options", {})
+            metrics = d.get("metrics") or []
+            default = next((m for m in metrics if m.get("is_default")), metrics[0] if metrics else {})
+            out.append({
+                "definition_id": d["metadata"]["id"],
+                "name": d["metadata"]["name"],
+                "description": d["metadata"].get("description", ""),
+                "datasource_id": spec.get("datasource", {}).get("id"),
+                "measure": basic.get("measure", {}).get("field"),
+                "aggregation": basic.get("measure", {}).get("aggregation"),
+                "time_dimension": basic.get("time_dimension", {}).get("field"),
+                "allowed_dimensions": ext.get("allowed_dimensions", []),
+                "allowed_granularities": ext.get("allowed_granularities", []),
+                "default_metric_id": default.get("id"),
+            })
+        return out
+
+
+@mcp.tool()
+def get_pulse_insights(metric_name: Optional[str] = None, definition_id: Optional[str] = None,
+                       bundle_type: str = "ban", granularity: Optional[str] = None,
+                       comparison: Optional[str] = None, period: Optional[str] = None) -> dict:
+    """Get Tableau Pulse insights for a metric: current value, change vs a
+    comparison period, top/bottom contributors, trend and unusual-change
+    insights. Use this for questions like "how is Total Sales doing?" or
+    "why did profit ratio change?". For a month-by-month time series, use
+    query_datasource instead (the response includes datasource_id).
+
+    Args:
+        metric_name: Metric definition name, e.g. "Total Sales" (case-insensitive).
+            Ignored when definition_id is given.
+        definition_id: Exact metric definition id (from list_pulse_metrics).
+        bundle_type: "ban" (current value + change + top insight per dimension,
+            default), "springboard" (value + change + top insight) or "detail"
+            (also trend, contributors and follow-ups; larger).
+        granularity: "day", "week", "month", "quarter" or "year". Defaults to the
+            metric's own default. Must be allowed by the definition.
+        comparison: "previous_period" or "year_ago" (year-over-year). Defaults
+            to the metric's own default.
+        period: "current_partial" (period to date) or "last_complete".
+    """
+    if bundle_type not in _PULSE_BUNDLE_TYPES:
+        raise ValueError(f"bundle_type must be one of {_PULSE_BUNDLE_TYPES}")
+    for value, allowed, label in ((granularity, _PULSE_GRANULARITY, "granularity"),
+                                  (comparison, _PULSE_COMPARISON, "comparison"),
+                                  (period, _PULSE_RANGE, "period")):
+        if value and value not in allowed:
+            raise ValueError(f"{label} must be one of {sorted(allowed)}")
+    if not metric_name and not definition_id:
+        raise ValueError("Provide metric_name or definition_id.")
+
+    with _session() as server:
+        definitions = _pulse_definitions(server)
+        if definition_id:
+            matches = [d for d in definitions if d["metadata"]["id"].lower() == definition_id.lower()]
+        else:
+            matches = [d for d in definitions if d["metadata"]["name"].lower() == metric_name.lower()]
+        if not matches:
+            names = sorted({d["metadata"]["name"] for d in definitions})
+            raise ValueError(f"No Pulse metric found. Available metrics: {names}")
+
+        defn = matches[0]
+        metric = _default_metric(server, defn)
+        body = _build_bundle_request(defn, metric, granularity, comparison, period)
+        bundle = _pulse_request(server, "POST", f"insights/{bundle_type}", body=body)
+
+        used = body["bundle_request"]["input"]["metric"]["metric_specification"]
+        note = None
+        if len(matches) > 1:
+            note = (f"{len(matches)} definitions are named '{defn['metadata']['name']}'; used the first. "
+                    "Pass definition_id (see list_pulse_metrics) to choose.")
+        return {
+            "metric": defn["metadata"]["name"],
+            "definition_id": defn["metadata"]["id"],
+            "datasource_id": defn["specification"]["datasource"]["id"],
+            "bundle_type": bundle_type,
+            "granularity": used["measurement_period"]["granularity"],
+            "period": used["measurement_period"]["range"],
+            "comparison": used["comparison"]["comparison"],
+            "insights": _summarise_bundle(bundle),
+            "note": note,
+        }
+
+
 if __name__ == "__main__":
     mcp.run()
